@@ -1,13 +1,14 @@
 # ---------------------------------------------
-# Paquexpress - API mínima en un solo archivo
+# Paquexpress - API INTEGRADA Y SIN ENCRIPTACIÓN
 # FastAPI + SQLAlchemy + JWT + Uploads
 # ---------------------------------------------
 import os
+import shutil # Necesario para la subida de archivos del proyecto anterior
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
+from fastapi.staticfiles import StaticFiles # Necesario para montar la carpeta uploads
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from passlib.context import CryptContext
 from jose import jwt, JWTError
 from sqlalchemy import create_engine, Column, Integer, String, Enum, Float, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -21,8 +22,6 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 DATABASE_URL = "mysql+pymysql://root:root@localhost/paquexpress"
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # --------------------------
 # DB SETUP
@@ -39,7 +38,8 @@ class Usuario(Base):
     id = Column(Integer, primary_key=True)
     nombre = Column(String(120))
     email = Column(String(150), unique=True)
-    password_hash = Column(String(255))
+    # Contraseña en texto plano para desarrollo (SIN ENCRIPTACIÓN)
+    password = Column(String(255)) 
     rol = Column(Enum("agente","admin"), default="agente")
 
 class Paquete(Base):
@@ -85,6 +85,9 @@ def create_access_token(data: dict):
 # --------------------------
 app = FastAPI()
 
+# AÑADIDO: Monta la carpeta 'uploads' para que las imágenes sean accesibles
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -93,7 +96,7 @@ app.add_middleware(
 )
 
 # --------------------------
-# LOGIN
+# LOGIN (SIN ENCRIPTACIÓN)
 # --------------------------
 @app.post("/login", response_model=LoginResponse)
 async def login(request: Request):
@@ -103,21 +106,19 @@ async def login(request: Request):
     email = data.get("email")
     password = data.get("password")
 
-    # Si la contraseña es muy larga → trúncala
-    if len(password.encode("utf-8")) > 72:
-        password = password[:72]
-
     user = db.query(Usuario).filter(Usuario.email == email).first()
 
     if not user:
         raise HTTPException(status_code=401, detail="Email no encontrado")
 
-    if not pwd_context.verify(password, user.password_hash):
+    # Comparación de contraseña en texto plano
+    if password != user.password: 
         raise HTTPException(status_code=401, detail="Contraseña incorrecta")
 
     token_data = {"sub": user.email, "id": user.id, "rol": user.rol}
     token = create_access_token(token_data)
 
+    # La API ahora devuelve "agentId" en la respuesta, que Flutter guarda
     return LoginResponse(token=token, agentId=user.id)
 
 
@@ -131,11 +132,12 @@ def get_paquetes(agente_id: int):
         Paquete.agente_asignado == agente_id,
         Paquete.estado != "entregado"
     ).all()
+    db.close()
     return paqs
 
 
 # --------------------------
-# REGISTRAR ENTREGA
+# REGISTRAR ENTREGA (LÓGICA DE SUBIDA DE ARCHIVOS DE TU API ANTERIOR)
 # --------------------------
 @app.post("/entregar")
 async def entregar(
@@ -147,30 +149,43 @@ async def entregar(
 ):
     db = SessionLocal()
 
-    # Guardar foto
-    if not os.path.exists("uploads"):
-        os.makedirs("uploads")
+    try:
+        # 1. Preparar la carpeta y la ruta del archivo
+        os.makedirs("uploads", exist_ok=True)
+        # Usamos el timestamp para asegurar un nombre de archivo único
+        filename = f"{datetime.now().timestamp()}_{foto.filename}"
+        file_path = os.path.join("uploads", filename)
+        
+        # 2. Guardar foto usando la lógica de shutil.copyfileobj (más eficiente)
+        with open(file_path, "wb") as buffer:
+             # Copia los datos binarios del archivo subido al archivo local
+            shutil.copyfileobj(foto.file, buffer) 
 
-    filename = f"{datetime.now().timestamp()}_{foto.filename}"
-    file_path = os.path.join("uploads", filename)
+        # 3. Crear registro de Entrega
+        # La URL que la app Flutter usará será '/uploads/nombre_archivo.jpg'
+        foto_url_publica = f"/uploads/{filename}"
 
-    with open(file_path, "wb") as buffer:
-        buffer.write(await foto.read())
+        entrega = Entrega(
+            paquete_id=paquete_id,
+            agente_id=agente_id,
+            lat_gps=lat_gps,
+            lon_gps=lon_gps,
+            foto_url=foto_url_publica, # Guarda la URL pública para mostrar la foto
+        )
+        db.add(entrega)
 
-    # Crear registro
-    entrega = Entrega(
-        paquete_id=paquete_id,
-        agente_id=agente_id,
-        lat_gps=lat_gps,
-        lon_gps=lon_gps,
-        foto_url=file_path,
-    )
-    db.add(entrega)
+        # 4. Marcar paquete entregado
+        paquete = db.query(Paquete).filter(Paquete.id == paquete_id).first()
+        if paquete:
+            paquete.estado = "entregado"
 
-    # Marcar paquete entregado
-    paquete = db.query(Paquete).filter(Paquete.id == paquete_id).first()
-    paquete.estado = "entregado"
+        db.commit()
 
-    db.commit()
-
-    return {"message": "Entrega registrada", "foto": file_path}
+        return {"message": "Entrega registrada", "foto_url": foto_url_publica}
+    
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error al registrar la entrega: {str(e)}")
+    
+    finally:
+        db.close()

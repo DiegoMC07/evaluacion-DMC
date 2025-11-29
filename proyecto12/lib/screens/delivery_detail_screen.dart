@@ -1,11 +1,13 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'; // Importar para usar kIsWeb
+import 'package:geolocator/geolocator.dart'; 
 import 'package:image_picker/image_picker.dart';
-import 'package:geolocator/geolocator.dart';
 import '../services/api_service.dart';
 
 class DeliveryDetailScreen extends StatefulWidget {
-  final Map paquete;
+  final Map<String, dynamic> paquete;
+
   const DeliveryDetailScreen({super.key, required this.paquete});
 
   @override
@@ -13,108 +15,257 @@ class DeliveryDetailScreen extends StatefulWidget {
 }
 
 class _DeliveryDetailScreenState extends State<DeliveryDetailScreen> {
-  final api = ApiService();
-  XFile? imageFile;
-  Position? position;
-  bool uploading = false;
-  bool gettingLocation = false;
+  final ApiService _apiService = ApiService();
+  final ImagePicker _picker = ImagePicker();
+
+  bool _loading = false;
+  XFile? _pickedFile; 
+  
+  String? _deliveredPhotoUrl;
+  String _currentStatus = 'PENDIENTE';
+
+  @override
+  void initState() {
+    super.initState();
+    _currentStatus = widget.paquete['estado'] ?? 'PENDIENTE'; 
+  }
+
+  // --- Manejadores de Interacción ---
 
   Future<void> _takePhoto() async {
-    final picker = ImagePicker();
-    final file = await picker.pickImage(source: ImageSource.camera, imageQuality: 80);
-    if (file != null) setState(() => imageFile = file);
+    final XFile? photo = await _picker.pickImage(source: ImageSource.camera);
+    if (photo != null) {
+      setState(() {
+        _pickedFile = photo;
+      });
+    }
   }
 
-  Future<void> _getLocation() async {
+  Future<void> _completeDelivery() async {
+    if (_pickedFile == null) {
+      _showSnackBar('Debe tomar una foto para completar la entrega.');
+      return;
+    }
+
+    setState(() => _loading = true);
+
     try {
-      setState(() => gettingLocation = true);
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enable location services')));
-        setState(() => gettingLocation = false);
-        return;
+      // 1. Obtener Ubicación (Lat/Lon)
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.medium,
+      );
+
+      // 2. Obtener ID del Agente
+      final agenteId = await _apiService.getStoredAgentId();
+      if (agenteId == null) {
+        throw Exception('ID de Agente no disponible. Por favor, vuelva a iniciar sesión.');
       }
-      LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.deniedForever) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Location permission denied forever')));
-        setState(() => gettingLocation = false);
-        return;
+      
+      // 3. OBTENER LOS BYTES DEL ARCHIVO (CLAVE para API Service corregido)
+      final fileBytes = await _pickedFile!.readAsBytes();
+      final fileName = _pickedFile!.name;
+
+
+      // 4. Subir Entrega usando los bytes (compatible con Web y Móvil)
+      final String? photoUrl = await _apiService.subirEntrega(
+        paqueteId: widget.paquete['id'] as int,
+        agenteId: agenteId,
+        lat: position.latitude,
+        lon: position.longitude,
+        fileBytes: fileBytes, // ¡CORREGIDO! Pasamos los bytes
+        fileName: fileName,   // ¡CORREGIDO! Pasamos el nombre
+      );
+
+      // 5. Lógica de Actualización de Estado y Cierre
+      if (photoUrl != null) {
+        _showSnackBar('Entrega registrada con éxito.');
+        if (mounted) {
+          setState(() {
+            _deliveredPhotoUrl = photoUrl;
+            _currentStatus = 'ENTREGADO';
+            _pickedFile = null; 
+          });
+        }
+        
+        if (mounted) {
+          // Devuelve 'true' para que la lista sepa que debe recargar
+          Navigator.pop(context, true); 
+        }
+
+      } else {
+        _showSnackBar('Fallo al registrar la entrega. Intente nuevamente.');
       }
-      final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
-      setState(() => position = pos);
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error getting location: $e')));
+      _showSnackBar('Error: ${e.toString()}');
     } finally {
-      setState(() => gettingLocation = false);
-    }
-  }
-
-  Future<void> _submit() async {
-    if (imageFile == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Capture una foto')));
-      return;
-    }
-    if (position == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Obtenga ubicación')));
-      return;
-    }
-    setState(() => uploading = true);
-
-    // agent id from token
-    final agentId = await api.getAgentIdFromToken();
-    if (agentId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se pudo obtener agent id desde token')));
-      setState(() => uploading = false);
-      return;
-    }
-
-    final ok = await api.subirEntrega(
-      paqueteId: widget.paquete['id'] is int ? widget.paquete['id'] as int : int.parse(widget.paquete['id'].toString()),
-      agenteId: agentId,
-      lat: position!.latitude,
-      lon: position!.longitude,
-      filePath: imageFile!.path,
-    );
-
-    setState(() => uploading = false);
-    if (ok) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Entrega registrada correctamente')));
-        Navigator.pop(context, true);
+        setState(() => _loading = false);
       }
-    } else {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Error al registrar entrega')));
     }
   }
+
+  void _showSnackBar(String message) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message)),
+      );
+    }
+  }
+
+  // --- Construcción de la Interfaz ---
 
   @override
   Widget build(BuildContext context) {
-    final paq = widget.paquete;
+    final isDelivered = _currentStatus == 'ENTREGADO';
+    
     return Scaffold(
-      appBar: AppBar(title: Text(paq['referencia'] ?? 'Detalle')),
+      appBar: AppBar(
+        title: Text(widget.paquete['referencia'] ?? 'Detalle del Paquete'),
+      ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16.0),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          Text(paq['direccion'] ?? '', style: const TextStyle(fontSize: 16)),
-          const SizedBox(height: 12),
-          if (imageFile != null) Image.file(File(imageFile!.path), height: 220, fit: BoxFit.cover),
-          const SizedBox(height: 8),
-          ElevatedButton.icon(onPressed: _takePhoto, icon: const Icon(Icons.camera_alt), label: const Text('Tomar foto')),
-          const SizedBox(height: 8),
-          ElevatedButton.icon(
-            onPressed: gettingLocation ? null : _getLocation,
-            icon: const Icon(Icons.my_location),
-            label: gettingLocation ? const Text('Obteniendo ubicación...') : const Text('Obtener ubicación'),
-          ),
-          const SizedBox(height: 8),
-          if (position != null) Text('Lat: ${position!.latitude.toStringAsFixed(6)}, Lon: ${position!.longitude.toStringAsFixed(6)}'),
-          const SizedBox(height: 20),
-          ElevatedButton(
-            onPressed: uploading ? null : _submit,
-            child: uploading ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Paquete entregado'),
-          )
-        ]),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Sección de Estatus
+            Card(
+              color: isDelivered ? Colors.green.shade100 : Colors.orange.shade100,
+              margin: const EdgeInsets.only(bottom: 20),
+              child: ListTile(
+                leading: Icon(
+                  isDelivered ? Icons.check_circle_outline : Icons.pending,
+                  color: isDelivered ? Colors.green.shade700 : Colors.orange.shade700,
+                ),
+                title: Text(
+                  'Estado Actual: $_currentStatus',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: isDelivered ? Colors.green.shade900 : Colors.orange.shade900,
+                  ),
+                ),
+                subtitle: isDelivered
+                    ? const Text('El paquete ha sido entregado exitosamente.')
+                    : const Text('Pendiente de entrega.'),
+              ),
+            ),
+
+            // Información del Paquete
+            Text(
+              'Dirección:',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            Text(widget.paquete['direccion'] ?? 'Dirección no especificada', style: const TextStyle(fontSize: 16)),
+            const SizedBox(height: 10),
+            Text(
+              'Receptor:',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            Text(widget.paquete['receptor_nombre'] ?? 'Desconocido', style: const TextStyle(fontSize: 16)),
+            const SizedBox(height: 20),
+
+            // Sección de Foto (Entrega Pendiente)
+            if (!isDelivered) ...[
+              Text(
+                'Evidencia de Entrega (Foto):',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 10),
+              
+              if (_pickedFile != null)
+                // --- PUNTO CLAVE: CORRECCIÓN PARA VISUALIZACIÓN WEB/MOBILE ---
+                kIsWeb 
+                  ? Image.network( // Usar Image.network para la web (el path es una URL temporal)
+                      _pickedFile!.path,
+                      height: 200,
+                      width: double.infinity,
+                      fit: BoxFit.cover,
+                    )
+                  : Image.file( // Usar Image.file para mobile/desktop
+                      File(_pickedFile!.path),
+                      height: 200,
+                      width: double.infinity,
+                      fit: BoxFit.cover,
+                    )
+                // ---------------------------------------------------
+              else
+                Container(
+                  height: 150,
+                  width: double.infinity,
+                  color: Colors.grey.shade200,
+                  alignment: Alignment.center,
+                  child: const Text('No hay foto capturada', style: TextStyle(color: Colors.grey)),
+                ),
+              
+              const SizedBox(height: 10),
+
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: _loading ? null : _takePhoto,
+                      icon: const Icon(Icons.camera_alt),
+                      label: const Text('Tomar Foto'),
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 15),
+                        backgroundColor: Colors.blue.shade600,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+
+              // Botón de Entrega
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: _pickedFile != null && !_loading ? _completeDelivery : null,
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 18),
+                    backgroundColor: Colors.green.shade700,
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                  child: _loading
+                      ? const SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                        )
+                      : const Text('MARCAR COMO ENTREGADO', style: TextStyle(fontSize: 18)),
+                ),
+              ),
+            ],
+
+            // Sección de Foto (Entrega Completada)
+            if (isDelivered && _deliveredPhotoUrl != null) ...[
+              const Divider(height: 40),
+              Text(
+                'Foto de Evidencia Registrada:',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 10),
+              Image.network(
+                _deliveredPhotoUrl!,
+                height: 250,
+                width: double.infinity,
+                fit: BoxFit.cover,
+                errorBuilder: (context, error, stackTrace) => Container(
+                  height: 250,
+                  width: double.infinity,
+                  color: Colors.red.shade100,
+                  alignment: Alignment.center,
+                  child: const Text('Error al cargar la imagen. Revise la Base URL.', style: TextStyle(color: Colors.red)),
+                ),
+              ),
+            ],
+            
+            const SizedBox(height: 50),
+          ],
+        ),
       ),
     );
   }

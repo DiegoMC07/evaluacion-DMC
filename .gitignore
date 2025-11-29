@@ -1,0 +1,22 @@
+# --- Python / FastAPI ---
+_pycache_/
+*.py[cod]
+.venv/
+env/
+.env
+
+# --- Flutter ---
+.dart_tool/
+.packages
+.pub/
+build/
+ios/.generated/
+packages
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# --- Archivos de sistema y IDE ---
+.idea/
+.vscode/
+*.ds_store
+Thumbs.db
